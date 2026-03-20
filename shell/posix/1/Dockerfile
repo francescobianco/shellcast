@@ -1,6 +1,6 @@
 FROM debian:bookworm-slim
 RUN apt-get update \
-    && apt-get install -y --no-install-recommends dash \
+    && apt-get install -y --no-install-recommends dash curl \
     && ln -sf /bin/dash /bin/posix \
     && rm -rf /var/lib/apt/lists/*
 LABEL shellcast.shell="posix" shellcast.version="1"

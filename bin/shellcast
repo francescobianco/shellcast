@@ -3,7 +3,7 @@
 # @package: shellcast
 # @build_type: bin
 # @build_with: Mush v0.2.0 (2026-03-20 develop)
-# @build_date: 2026-03-20T21:42:27Z
+# @build_date: 2026-03-20T21:52:44Z
 set -e
 use() { return 0; }
 extern() { return 0; }
