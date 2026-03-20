@@ -3,3 +3,5 @@ RUN apt-get update \
     && apt-get install -y --no-install-recommends mksh \
     && rm -rf /var/lib/apt/lists/*
 LABEL shellcast.shell="mksh" shellcast.version="1"
+RUN printf '#!/bin/sh\nmksh -c '"'"'echo "mksh $KSH_VERSION"'"'"' 2>/dev/null\n' \
+    > /usr/local/bin/shellcast-version && chmod +x /usr/local/bin/shellcast-version

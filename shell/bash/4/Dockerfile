@@ -1,3 +1,3 @@
-FROM bash:5
-LABEL shellcast.shell="bash" shellcast.version="5"
+FROM bash:4
+LABEL shellcast.shell="bash" shellcast.version="4"
 RUN printf '#!/bin/sh\nbash --version 2>&1 | head -1\n' > /usr/local/bin/shellcast-version && chmod +x /usr/local/bin/shellcast-version

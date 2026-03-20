@@ -229,3 +229,90 @@ shellcast_executor_list_shells() {
   printf '  %s/shell/<type>/<major>/Dockerfile\n' "$PWD"
   printf '  %s/.shellcast/shell/<type>/<major>/Dockerfile\n' "$HOME"
 }
+
+# Get the shell command to run inside a container to extract its real version.
+# Each shell type needs a different approach because not all support --version.
+# Get the shell command to run inside a container to extract its real version.
+# The command runs via: docker run --rm <tag> sh -c "<version_cmd>"
+# IMPORTANT: do NOT use $VAR shell syntax in the returned string — it will be
+# expanded by the outer shell when passed to docker. Use /usr/local/bin/shellcast-version
+# (a label-embedded script) or package-manager queries that avoid format strings.
+shellcast_executor_version_cmd() {
+  local type; type="$1"
+  case "$type" in
+    bash)
+      printf 'bash --version 2>&1 | head -1'
+      ;;
+    zsh)
+      printf 'zsh --version 2>&1 | head -1'
+      ;;
+    dash|posix)
+      # dash has no --version; use dpkg-query without format variables
+      # dpkg-query -W outputs: "dash\t0.5.12-2" — cut the version field
+      printf 'dpkg-query -W dash 2>/dev/null | awk '"'"'{print "dash " $2}'"'"' || echo "dash (version unknown)"'
+      ;;
+    sh|ash)
+      # Alpine sh/ash is BusyBox; query apk and take first token (e.g. busybox-1.36.1-r20)
+      printf 'apk info busybox 2>/dev/null | head -1 | cut -d" " -f1 || echo "sh/ash (version unknown)"'
+      ;;
+    busybox)
+      # First line of busybox output: "BusyBox v1.37.0 (...)"
+      printf 'busybox 2>&1 | head -1'
+      ;;
+    ksh)
+      # AT&T ksh --version has leading spaces; strip them
+      printf 'ksh --version 2>&1 | head -1 | sed '"'"'s/^[[:space:]]*//'"'"
+      ;;
+    mksh)
+      # mksh exposes version via KSH_VERSION, readable without variable expansion issues
+      # because we run it as a literal arg to -c, not through our outer shell
+      printf "mksh -c 'echo mksh \$KSH_VERSION' 2>/dev/null || dpkg-query -W mksh 2>/dev/null | awk '{print \"mksh \" \$2}'"
+      ;;
+    yash)
+      printf 'yash --version 2>&1 | head -1'
+      ;;
+    *)
+      printf '%s --version 2>&1 | head -1 || %s -version 2>&1 | head -1 || echo "%s (version unknown)"' \
+        "$type" "$type" "$type"
+      ;;
+  esac
+}
+
+# Run version-introspection inside each registered shell container.
+# Builds images that are missing, then queries the real shell version.
+shellcast_executor_discover_versions() {
+  local line; line=""
+  printf '%-20s %-30s %s\n' "SHELL:VERSION" "IMAGE" "REAL VERSION"
+  printf '%s\n' "-------------------- ------------------------------ ------------------------------"
+
+  for line in $SHELLCAST_REGISTRY; do
+    local type; type=$(shellcast_executor_type "$line")
+    local tag; tag=$(shellcast_executor_image_tag "$line")
+
+    # Ensure image is ready, suppress build output unless it fails
+    shellcast_executor_ensure_image "$line" >/dev/null 2>&1 || {
+      printf '%-20s %-30s %s\n' "$line" "$tag" "[image build failed]"
+      continue
+    }
+
+    # Prefer the embedded /usr/local/bin/shellcast-version script in the image,
+    # fall back to the shell-specific version command.
+    local ver_line; ver_line=""
+    ver_line=$(docker run --rm "$tag" shellcast-version 2>/dev/null) || true
+
+    if [ -z "$ver_line" ]; then
+      local ver_cmd; ver_cmd=""
+      ver_cmd=$(shellcast_executor_version_cmd "$type")
+      ver_line=$(docker run --rm "$tag" sh -c "$ver_cmd" 2>/dev/null) || true
+    fi
+
+    if [ -z "$ver_line" ]; then
+      ver_line="[version unavailable]"
+    fi
+
+    # Trim leading/trailing whitespace
+    ver_line=$(printf '%s' "$ver_line" | sed 's/^[[:space:]]*//' | sed 's/[[:space:]]*$//')
+
+    printf '%-20s %-30s %s\n' "$line" "$tag" "$ver_line"
+  done
+}

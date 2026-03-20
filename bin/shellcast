@@ -3,7 +3,7 @@
 # @package: shellcast
 # @build_type: bin
 # @build_with: Mush v0.2.0 (2026-03-20 develop)
-# @build_date: 2026-03-20T21:23:33Z
+# @build_date: 2026-03-20T21:42:27Z
 set -e
 use() { return 0; }
 extern() { return 0; }
@@ -43,6 +43,9 @@ main() {
       ;;
     shells)
       shellcast_main_cmd_shells
+      ;;
+    versions)
+      shellcast_executor_discover_versions
       ;;
     --version|-V)
       printf 'shellcast %s\n' "$SHELLCAST_VERSION"
@@ -148,12 +151,15 @@ Usage: shellcast <command> [options]
 
 Commands:
   run <script>    Run script across multiple shell environments
-  shells          List available shell environments
+  shells          List registered shell environments
+  versions        Discover real versions of all shells by running inside Docker
 
 Options for 'run':
-  --ref <shell:version>   Reference shell for comparison (default: first in --on list)
+  --ref <shell:version>   Reference shell for comparison (default: bash:5)
   --on <shells>           Target shells, comma-separated  e.g. bash:5,zsh:5,dash:1
+  --on-all                Run against all registered shells
   --args "<args>"         Arguments to pass to the script
+  --                      Separator: everything after is passed to the script
   --parallel              Run all shells in parallel
   --report <file>         Save JSON report to file
   --ignore <pattern>      Ignore output lines matching grep pattern
@@ -201,6 +207,10 @@ shellcast_cli_parse_run() {
       --on=*)
         SC_TARGETS="${1#*=}"
         ;;
+      --on-all)
+        # Use all shells from the registry as targets
+        SC_TARGETS=$(printf '%s' "$SHELLCAST_REGISTRY" | tr '\n' ',' | sed 's/^,//; s/,$//')
+        ;;
       --args)
         shift
         SC_ARGS="$1"
@@ -228,6 +238,12 @@ shellcast_cli_parse_run() {
       --verbose|-v)
         SC_VERBOSE=1
         ;;
+      --)
+        # Everything after -- is passed directly to the script
+        shift
+        SC_ARGS="$*"
+        break
+        ;;
       *)
         printf 'shellcast run: unknown option: %s\n' "$1" >&2
         return 1
@@ -237,13 +253,13 @@ shellcast_cli_parse_run() {
   done
 
   if [ -z "$SC_TARGETS" ]; then
-    printf 'shellcast run: --on <shells> is required\n' >&2
+    printf 'shellcast run: --on <shells> or --on-all is required\n' >&2
     return 1
   fi
 
-  # Default reference to first target shell
+  # Default reference is always bash:5
   if [ -z "$SC_REF" ]; then
-    SC_REF="$(printf '%s' "$SC_TARGETS" | cut -d',' -f1)"
+    SC_REF="bash:5"
   fi
 
   export SC_SCRIPT SC_REF SC_TARGETS SC_ARGS SC_PARALLEL SC_REPORT SC_IGNORE SC_VERBOSE
@@ -259,7 +275,11 @@ bash:5
 zsh:5
 dash:1
 sh:1
+ash:1
+busybox:1
 ksh:1
+mksh:1
+posix:1
 "
 
 # Check if a shell:version is in the registry.
@@ -317,12 +337,16 @@ shellcast_executor_image_tag() {
 # (e.g. official bash:5 image has bash at /usr/local/bin/bash, not /bin/bash).
 shellcast_executor_bin() {
   case "$1" in
-    bash) printf 'bash' ;;
-    zsh)  printf 'zsh'  ;;
-    dash) printf 'dash' ;;
-    sh)   printf 'sh'   ;;
-    ksh)  printf 'ksh'  ;;
-    *)    printf '%s' "$1" ;;
+    bash)    printf 'bash'    ;;
+    zsh)     printf 'zsh'     ;;
+    dash)    printf 'dash'    ;;
+    sh)      printf 'sh'      ;;
+    ash)     printf 'ash'     ;;
+    busybox) printf 'sh'      ;;
+    ksh)     printf 'ksh'     ;;
+    mksh)    printf 'mksh'    ;;
+    posix)   printf 'dash'    ;;
+    *)       printf '%s' "$1" ;;
   esac
 }
 
@@ -513,6 +537,93 @@ shellcast_executor_list_shells() {
   printf '\nCustom shells: place a Dockerfile at:\n'
   printf '  %s/shell/<type>/<major>/Dockerfile\n' "$PWD"
   printf '  %s/.shellcast/shell/<type>/<major>/Dockerfile\n' "$HOME"
+}
+
+# Get the shell command to run inside a container to extract its real version.
+# Each shell type needs a different approach because not all support --version.
+# Get the shell command to run inside a container to extract its real version.
+# The command runs via: docker run --rm <tag> sh -c "<version_cmd>"
+# IMPORTANT: do NOT use $VAR shell syntax in the returned string — it will be
+# expanded by the outer shell when passed to docker. Use /usr/local/bin/shellcast-version
+# (a label-embedded script) or package-manager queries that avoid format strings.
+shellcast_executor_version_cmd() {
+  local type; type="$1"
+  case "$type" in
+    bash)
+      printf 'bash --version 2>&1 | head -1'
+      ;;
+    zsh)
+      printf 'zsh --version 2>&1 | head -1'
+      ;;
+    dash|posix)
+      # dash has no --version; use dpkg-query without format variables
+      # dpkg-query -W outputs: "dash\t0.5.12-2" — cut the version field
+      printf 'dpkg-query -W dash 2>/dev/null | awk '"'"'{print "dash " $2}'"'"' || echo "dash (version unknown)"'
+      ;;
+    sh|ash)
+      # Alpine sh/ash is BusyBox; query apk and take first token (e.g. busybox-1.36.1-r20)
+      printf 'apk info busybox 2>/dev/null | head -1 | cut -d" " -f1 || echo "sh/ash (version unknown)"'
+      ;;
+    busybox)
+      # First line of busybox output: "BusyBox v1.37.0 (...)"
+      printf 'busybox 2>&1 | head -1'
+      ;;
+    ksh)
+      # AT&T ksh --version has leading spaces; strip them
+      printf 'ksh --version 2>&1 | head -1 | sed '"'"'s/^[[:space:]]*//'"'"
+      ;;
+    mksh)
+      # mksh exposes version via KSH_VERSION, readable without variable expansion issues
+      # because we run it as a literal arg to -c, not through our outer shell
+      printf "mksh -c 'echo mksh \$KSH_VERSION' 2>/dev/null || dpkg-query -W mksh 2>/dev/null | awk '{print \"mksh \" \$2}'"
+      ;;
+    yash)
+      printf 'yash --version 2>&1 | head -1'
+      ;;
+    *)
+      printf '%s --version 2>&1 | head -1 || %s -version 2>&1 | head -1 || echo "%s (version unknown)"' \
+        "$type" "$type" "$type"
+      ;;
+  esac
+}
+
+# Run version-introspection inside each registered shell container.
+# Builds images that are missing, then queries the real shell version.
+shellcast_executor_discover_versions() {
+  local line; line=""
+  printf '%-20s %-30s %s\n' "SHELL:VERSION" "IMAGE" "REAL VERSION"
+  printf '%s\n' "-------------------- ------------------------------ ------------------------------"
+
+  for line in $SHELLCAST_REGISTRY; do
+    local type; type=$(shellcast_executor_type "$line")
+    local tag; tag=$(shellcast_executor_image_tag "$line")
+
+    # Ensure image is ready, suppress build output unless it fails
+    shellcast_executor_ensure_image "$line" >/dev/null 2>&1 || {
+      printf '%-20s %-30s %s\n' "$line" "$tag" "[image build failed]"
+      continue
+    }
+
+    # Prefer the embedded /usr/local/bin/shellcast-version script in the image,
+    # fall back to the shell-specific version command.
+    local ver_line; ver_line=""
+    ver_line=$(docker run --rm "$tag" shellcast-version 2>/dev/null) || true
+
+    if [ -z "$ver_line" ]; then
+      local ver_cmd; ver_cmd=""
+      ver_cmd=$(shellcast_executor_version_cmd "$type")
+      ver_line=$(docker run --rm "$tag" sh -c "$ver_cmd" 2>/dev/null) || true
+    fi
+
+    if [ -z "$ver_line" ]; then
+      ver_line="[version unavailable]"
+    fi
+
+    # Trim leading/trailing whitespace
+    ver_line=$(printf '%s' "$ver_line" | sed 's/^[[:space:]]*//' | sed 's/[[:space:]]*$//')
+
+    printf '%-20s %-30s %s\n' "$line" "$tag" "$ver_line"
+  done
 }
 
 # Compare reference and target shell outputs.

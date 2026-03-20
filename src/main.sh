@@ -28,6 +28,9 @@ main() {
     shells)
       shellcast_main_cmd_shells
       ;;
+    versions)
+      shellcast_executor_discover_versions
+      ;;
     --version|-V)
       printf 'shellcast %s\n' "$SHELLCAST_VERSION"
       ;;
