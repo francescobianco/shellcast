@@ -6,12 +6,16 @@ Usage: shellcast <command> [options]
 Commands:
   run <script>    Run script across multiple shell environments
   shells          List registered shell environments
-  versions        Discover real versions of all shells by running inside Docker
+  versions        Discover real versions of all shells (Docker + local)
 
 Options for 'run':
   --ref <shell:version>   Reference shell for comparison (default: bash:5)
+                          Use "local" to compare against the current machine
   --on <shells>           Target shells, comma-separated  e.g. bash:5,zsh:5,dash:1
+                          Use "local" to include the current machine as a target
   --on-all                Run against all registered shells
+  --os <os>               OS environments, comma-separated (default: unset = linux only)
+                          e.g. --os linux,macos  tests on both OS flavors
   --args "<args>"         Arguments to pass to the script
   --                      Separator: everything after is passed to the script
   --parallel              Run all shells in parallel
@@ -20,9 +24,10 @@ Options for 'run':
   --verbose               Verbose output
 
 Examples:
-  shellcast run script.sh --on bash:5,zsh:5 --ref bash:5
+  shellcast run script.sh --on bash:5,zsh:5
+  shellcast run script.sh --ref local --on bash:5,dash:1
+  shellcast run script.sh --on bash:5,local --os linux,macos
   shellcast run script.sh --on bash:5,bash:4,dash:1 --parallel --report out.json
-  shellcast run script.sh --on bash:5,zsh:5 --ignore "^#" --verbose
 EOF
 }
 
@@ -30,6 +35,7 @@ shellcast_cli_parse_run() {
   SC_SCRIPT=""
   SC_REF=""
   SC_TARGETS=""
+  SC_OS=""
   SC_ARGS=""
   SC_PARALLEL=0
   SC_REPORT=""
@@ -62,8 +68,14 @@ shellcast_cli_parse_run() {
         SC_TARGETS="${1#*=}"
         ;;
       --on-all)
-        # Use all shells from the registry as targets
         SC_TARGETS=$(printf '%s' "$SHELLCAST_REGISTRY" | tr '\n' ',' | sed 's/^,//; s/,$//')
+        ;;
+      --os)
+        shift
+        SC_OS="$1"
+        ;;
+      --os=*)
+        SC_OS="${1#*=}"
         ;;
       --args)
         shift
@@ -93,7 +105,6 @@ shellcast_cli_parse_run() {
         SC_VERBOSE=1
         ;;
       --)
-        # Everything after -- is passed directly to the script
         shift
         SC_ARGS="$*"
         break
@@ -111,10 +122,10 @@ shellcast_cli_parse_run() {
     return 1
   fi
 
-  # Default reference is always bash:5
+  # Default reference is bash:5 (or local if specified by user)
   if [ -z "$SC_REF" ]; then
     SC_REF="bash:5"
   fi
 
-  export SC_SCRIPT SC_REF SC_TARGETS SC_ARGS SC_PARALLEL SC_REPORT SC_IGNORE SC_VERBOSE
+  export SC_SCRIPT SC_REF SC_TARGETS SC_OS SC_ARGS SC_PARALLEL SC_REPORT SC_IGNORE SC_VERBOSE
 }

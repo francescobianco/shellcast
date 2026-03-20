@@ -5,4 +5,4 @@ RUN apt-get update \
     && rm -rf /var/lib/apt/lists/*
 LABEL shellcast.shell="posix" shellcast.version="1"
 RUN printf '#!/bin/sh\ndpkg-query -W dash 2>/dev/null | awk '"'"'{print "posix/dash " $2}'"'"'\n' \
-    > /usr/local/bin/shellcast-version && chmod +x /usr/local/bin/shellcast-version
+    > /usr/local/bin/shell-version && chmod +x /usr/local/bin/shell-version

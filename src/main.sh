@@ -45,6 +45,38 @@ main() {
   esac
 }
 
+# Expand a comma-separated list of shell:version tokens across OS values.
+# "local" tokens are never OS-expanded (they always refer to the current machine).
+# Example: shells="bash:5,local"  oses="linux,macos"
+#       => "bash:5@linux,bash:5@macos,local"
+shellcast_main_expand_os() {
+  local shells; shells="$1"
+  local oses; oses="$2"
+  local result; result=""
+  local s; s=""
+  local os; os=""
+  local token; token=""
+
+  for s in $(printf '%s' "$shells" | tr ',' '\n'); do
+    if [ "$s" = "local" ]; then
+      case ",$result," in
+        *",local,"*) ;;
+        *) result="${result},local" ;;
+      esac
+    else
+      for os in $(printf '%s' "$oses" | tr ',' '\n'); do
+        token="${s}@${os}"
+        case ",$result," in
+          *",$token,"*) ;;
+          *) result="${result},${token}" ;;
+        esac
+      done
+    fi
+  done
+
+  printf '%s' "$result" | sed 's/^,//'
+}
+
 shellcast_main_cmd_run() {
   shellcast_cli_parse_run "$@" || return 1
 
@@ -53,17 +85,29 @@ shellcast_main_cmd_run() {
     return 1
   fi
 
-  # Build deduplicated list: ref + targets
-  local all_shells; all_shells="$SC_REF"
+  # Expand shells × OS if --os was specified
+  local targets; targets="$SC_TARGETS"
+  local ref; ref="$SC_REF"
+  if [ -n "$SC_OS" ]; then
+    targets=$(shellcast_main_expand_os "$SC_TARGETS" "$SC_OS")
+    # Ref gets the first OS in the list (unless it is "local")
+    if [ "$SC_REF" != "local" ]; then
+      local ref_os; ref_os=$(printf '%s' "$SC_OS" | cut -d',' -f1)
+      ref="${SC_REF}@${ref_os}"
+    fi
+  fi
+
+  # Build deduplicated execution set: ref + all targets
+  local all_shells; all_shells="$ref"
   local s; s=""
-  for s in $(printf '%s' "$SC_TARGETS" | tr ',' '\n'); do
+  for s in $(printf '%s' "$targets" | tr ',' '\n'); do
     case ",$all_shells," in
       *",$s,"*) ;;
       *) all_shells="${all_shells},${s}" ;;
     esac
   done
 
-  # Ensure all Docker images are ready
+  # Ensure all images / local runners are ready
   for s in $(printf '%s' "$all_shells" | tr ',' '\n'); do
     shellcast_executor_ensure_image "$s" || return 1
   done
@@ -74,7 +118,7 @@ shellcast_main_cmd_run() {
   # shellcheck disable=SC2064
   trap "rm -rf '$tmp_dir'" EXIT INT TERM
 
-  shellcast_reporter_print_header "$SC_SCRIPT" "$SC_REF"
+  shellcast_reporter_print_header "$SC_SCRIPT" "$ref"
 
   # Execute script on each shell (sequential or parallel)
   local pids; pids=""
@@ -89,22 +133,20 @@ shellcast_main_cmd_run() {
     fi
   done
 
-  # Wait for parallel jobs to finish
   if [ "$SC_PARALLEL" = "1" ] && [ -n "$pids" ]; then
     # shellcheck disable=SC2086
     wait $pids 2>/dev/null || true
   fi
 
-  # Compare each target against reference.
-  # Use if/else to avoid set -e triggering on non-zero comparator exit (means "diff found").
+  # Compare each target against reference
   local overall; overall=0
   local key; key=""
   local diff_file; diff_file=""
   local pass; pass=0
-  for s in $(printf '%s' "$SC_TARGETS" | tr ',' '\n'); do
+  for s in $(printf '%s' "$targets" | tr ',' '\n'); do
     key=$(shellcast_executor_key "$s")
     diff_file="${tmp_dir}/${key}.diff"
-    if shellcast_comparator_compare "$SC_REF" "$s" "$tmp_dir" "$SC_IGNORE" "$diff_file"; then
+    if shellcast_comparator_compare "$ref" "$s" "$tmp_dir" "$SC_IGNORE" "$diff_file"; then
       pass=0
     else
       pass=1
@@ -115,10 +157,9 @@ shellcast_main_cmd_run() {
 
   shellcast_reporter_print_summary "$overall"
 
-  # Write JSON report if requested
   if [ -n "$SC_REPORT" ]; then
     shellcast_reporter_write_json \
-      "$SC_SCRIPT" "$SC_REF" "$SC_TARGETS" "$tmp_dir" "$SC_REPORT"
+      "$SC_SCRIPT" "$ref" "$targets" "$tmp_dir" "$SC_REPORT"
     printf 'Report saved to: %s\n' "$SC_REPORT"
   fi
 
