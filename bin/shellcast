@@ -3,7 +3,7 @@
 # @package: shellcast
 # @build_type: bin
 # @build_with: Mush v0.2.0 (2026-03-20 develop)
-# @build_date: 2026-03-20T22:33:52Z
+# @build_date: 2026-03-20T22:41:06Z
 set -e
 use() { return 0; }
 extern() { return 0; }
@@ -568,8 +568,9 @@ shellcast_executor_run_local() {
   fi
 
   local exit_code; exit_code=0
+  local shell_bin; shell_bin="${SHELL:-sh}"
   # shellcheck disable=SC2086
-  sh "$script" $args > "$stdout_file" 2> "$stderr_file" || exit_code=$?
+  "$shell_bin" "$script" $args > "$stdout_file" 2> "$stderr_file" || exit_code=$?
 
   printf '%d' "$exit_code" > "$exit_file"
 
@@ -682,40 +683,29 @@ shellcast_executor_version_cmd() {
   esac
 }
 
-# Show local machine shell versions (for the "local" entry in versions output)
-shellcast_executor_local_versions() {
-  local versions; versions=""
-  local v; v=""
-  if command -v bash >/dev/null 2>&1; then
-    v=$(bash --version 2>&1 | head -1)
-    versions="${versions}  bash: ${v}\n"
+# Return the version of the user's default shell ($SHELL).
+shellcast_executor_local_version_summary() {
+  local shell_bin; shell_bin="${SHELL:-sh}"
+  local shell_name; shell_name=$(basename "$shell_bin")
+  local ver; ver=""
+  ver=$("$shell_bin" --version 2>&1 | head -1 | grep -oE '[0-9]+\.[0-9]+(\.[0-9]+)?' | head -1)
+  if [ -n "$ver" ]; then
+    printf '%s %s (%s)' "$shell_name" "$ver" "$shell_bin"
+  else
+    printf '%s (%s)' "$shell_name" "$shell_bin"
   fi
-  if command -v zsh >/dev/null 2>&1; then
-    v=$(zsh --version 2>&1 | head -1)
-    versions="${versions}  zsh: ${v}\n"
-  fi
-  if command -v dash >/dev/null 2>&1; then
-    v=$(dash --version 2>&1 | head -1 || dpkg-query -W dash 2>/dev/null | awk '{print "dash " $2}' || printf 'dash (version unknown)')
-    versions="${versions}  dash: ${v}\n"
-  fi
-  if command -v sh >/dev/null 2>&1; then
-    v=$(sh --version 2>&1 | head -1 || printf 'sh (version unknown)')
-    versions="${versions}  sh: ${v}\n"
-  fi
-  printf '%b' "$versions"
 }
 
-# Run version-introspection inside each registered shell container + local.
+# Run version-introspection inside each registered shell container + local + macos.
 shellcast_executor_discover_versions() {
   local line; line=""
   printf '%-22s %-30s %s\n' "SHELL:VERSION" "IMAGE" "REAL VERSION"
   printf '%s\n' "---------------------- ------------------------------ ------------------------------"
 
-  # Show local entry first
-  printf '%-22s %-30s %s\n' "local" "(host)" "$(uname -s) $(uname -r)"
-  shellcast_executor_local_versions | while IFS= read -r vline; do
-    printf '  %s\n' "$vline"
-  done
+  # local entry
+  local local_ver; local_ver=""
+  local_ver=$(shellcast_executor_local_version_summary)
+  printf '%-22s %-30s %s\n' "local" "(host)" "$local_ver"
 
   for line in $SHELLCAST_REGISTRY; do
     local type; type=$(shellcast_executor_type "$line")
@@ -743,6 +733,25 @@ shellcast_executor_discover_versions() {
 
     printf '%-22s %-30s %s\n' "$line" "$tag" "$ver_line"
   done
+
+  # macOS BSD userland image
+  local macos_ver; macos_ver="${SHELLCAST_MACOS_VERSION:-catalina}"
+  local macos_token; macos_token="macos:${macos_ver}@macos"
+  local macos_tag; macos_tag="shellcast-macos-${macos_ver}"
+
+  shellcast_executor_ensure_image "$macos_token" >/dev/null 2>&1 || {
+    printf '%-22s %-30s %s\n' "macos:${macos_ver}" "$macos_tag" "[image build failed]"
+    return 0
+  }
+
+  local macos_ver_line; macos_ver_line=""
+  macos_ver_line=$(docker run --rm "$macos_tag" shell-version 2>/dev/null) || true
+  if [ -z "$macos_ver_line" ]; then
+    macos_ver_line="[version unavailable]"
+  fi
+  macos_ver_line=$(printf '%s' "$macos_ver_line" | head -1 | sed 's/^[[:space:]]*//' | sed 's/[[:space:]]*$//')
+
+  printf '%-22s %-30s %s\n' "macos:${macos_ver}" "$macos_tag" "$macos_ver_line"
 }
 
 
