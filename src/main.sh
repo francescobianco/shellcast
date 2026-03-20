@@ -1,5 +1,6 @@
 
 module cli
+module registry
 module executor
 module comparator
 module reporter
@@ -91,7 +92,8 @@ shellcast_main_cmd_run() {
     wait $pids 2>/dev/null || true
   fi
 
-  # Compare each target against reference
+  # Compare each target against reference.
+  # Use if/else to avoid set -e triggering on non-zero comparator exit (means "diff found").
   local overall; overall=0
   local key; key=""
   local diff_file; diff_file=""
@@ -99,12 +101,13 @@ shellcast_main_cmd_run() {
   for s in $(printf '%s' "$SC_TARGETS" | tr ',' '\n'); do
     key=$(shellcast_executor_key "$s")
     diff_file="${tmp_dir}/${key}.diff"
-    shellcast_comparator_compare "$SC_REF" "$s" "$tmp_dir" "$SC_IGNORE" "$diff_file"
-    pass=$?
-    shellcast_reporter_print_result "$s" "$pass" "$diff_file"
-    if [ "$pass" != "0" ]; then
+    if shellcast_comparator_compare "$SC_REF" "$s" "$tmp_dir" "$SC_IGNORE" "$diff_file"; then
+      pass=0
+    else
+      pass=1
       overall=1
     fi
+    shellcast_reporter_print_result "$s" "$pass" "$diff_file"
   done
 
   shellcast_reporter_print_summary "$overall"

@@ -23,31 +23,97 @@ shellcast_executor_image_tag() {
   printf 'shellcast-%s-%s' "$type" "$major"
 }
 
-# Get shell binary path inside container
+# Get shell binary name for use inside the container.
+# Uses unqualified names so the container's PATH resolves them correctly
+# (e.g. official bash:5 image has bash at /usr/local/bin/bash, not /bin/bash).
 shellcast_executor_bin() {
   case "$1" in
-    bash) printf '/bin/bash' ;;
-    zsh)  printf '/bin/zsh'  ;;
-    dash) printf '/bin/dash' ;;
-    sh)   printf '/bin/sh'   ;;
-    ksh)  printf '/bin/ksh'  ;;
-    *)    printf '/bin/%s' "$1" ;;
+    bash)    printf 'bash'    ;;
+    zsh)     printf 'zsh'     ;;
+    dash)    printf 'dash'    ;;
+    sh)      printf 'sh'      ;;
+    ash)     printf 'ash'     ;;
+    busybox) printf 'sh'      ;;
+    ksh)     printf 'ksh'     ;;
+    mksh)    printf 'mksh'    ;;
+    posix)   printf 'dash'    ;;
+    *)       printf '%s' "$1" ;;
   esac
 }
 
+# Resolve Dockerfile path for a shell type and major version.
+# Lookup order:
+#   1. $PWD/shell/<type>/<major>/Dockerfile             — project-local override
+#   2. $HOME/.shellcast/shell/<type>/<major>/Dockerfile — user cache
+#   3. Download from GitHub into user cache (only for shells in the registry)
+# Prints the resolved file path on stdout; returns 1 on failure.
+shellcast_executor_resolve_dockerfile() {
+  local type; type="$1"
+  local major; major="$2"
+
+  # 1. Project-local override
+  local local_df; local_df="${PWD}/shell/${type}/${major}/Dockerfile"
+  if [ -f "$local_df" ]; then
+    printf '%s' "$local_df"
+    return 0
+  fi
+
+  # 2. User cache
+  local cache_df; cache_df="${HOME}/.shellcast/shell/${type}/${major}/Dockerfile"
+  if [ -f "$cache_df" ]; then
+    printf '%s' "$cache_df"
+    return 0
+  fi
+
+  # 3. Download from GitHub — only if the shell is in the registry
+  if ! shellcast_registry_is_known "${type}:${major}"; then
+    printf 'shellcast: unknown shell %s:%s (not in registry)\n' "$type" "$major" >&2
+    return 1
+  fi
+
+  local raw_url; raw_url="https://raw.githubusercontent.com/francescobianco/shellcast/main/shell/${type}/${major}/Dockerfile"
+  local cache_dir; cache_dir="${HOME}/.shellcast/shell/${type}/${major}"
+
+  printf '[shellcast] fetching Dockerfile for %s:%s from GitHub...\n' "$type" "$major" >&2
+
+  mkdir -p "$cache_dir" || return 1
+
+  if command -v curl >/dev/null 2>&1; then
+    curl -fsSL "$raw_url" -o "$cache_df" 2>/dev/null || {
+      rm -f "$cache_df"
+      printf 'shellcast: could not fetch Dockerfile for %s:%s from GitHub\n' "$type" "$major" >&2
+      return 1
+    }
+  elif command -v wget >/dev/null 2>&1; then
+    wget -qO "$cache_df" "$raw_url" 2>/dev/null || {
+      rm -f "$cache_df"
+      printf 'shellcast: could not fetch Dockerfile for %s:%s from GitHub\n' "$type" "$major" >&2
+      return 1
+    }
+  else
+    printf 'shellcast: curl or wget required to fetch shell Dockerfiles\n' >&2
+    return 1
+  fi
+
+  printf '%s' "$cache_df"
+}
+
 # Get Dockerfile content for a shell type and major version.
-# Checks $SHELLCAST_HOME/shell/<type>/<major>/Dockerfile first,
-# then falls back to built-in templates.
+# Tries to resolve from disk/GitHub first, then falls back to built-in templates.
 shellcast_executor_dockerfile() {
   local type; type="$1"
   local major; major="$2"
 
-  local df_path; df_path="${SHELLCAST_HOME}/shell/${type}/${major}/Dockerfile"
-  if [ -f "$df_path" ]; then
+  local df_path; df_path=""
+  if df_path=$(shellcast_executor_resolve_dockerfile "$type" "$major" 2>/dev/null); then
     cat "$df_path"
     return 0
   fi
 
+  # Built-in fallback templates
+  if [ "${SC_VERBOSE:-0}" = "1" ]; then
+    printf '[shellcast] using built-in Dockerfile template for %s:%s\n' "$type" "$major" >&2
+  fi
   case "$type" in
     bash)
       printf 'FROM bash:%s\n' "$major"
@@ -89,7 +155,9 @@ shellcast_executor_ensure_image() {
   local tag; tag=$(shellcast_executor_image_tag "$shell_ver")
 
   if docker image inspect "$tag" >/dev/null 2>&1; then
-    [ "${SC_VERBOSE:-0}" = "1" ] && printf '[shellcast] image %s already exists\n' "$tag"
+    if [ "${SC_VERBOSE:-0}" = "1" ]; then
+      printf '[shellcast] image %s already exists\n' "$tag"
+    fi
     return 0
   fi
 
@@ -127,36 +195,37 @@ shellcast_executor_run() {
   local script_base; script_base=""
   script_base=$(basename "$script_abs")
 
-  [ "$verbose" = "1" ] && printf '[shellcast] running %s on %s\n' "$script_base" "$shell_ver"
+  if [ "$verbose" = "1" ]; then
+    printf '[shellcast] running %s on %s\n' "$script_base" "$shell_ver"
+  fi
 
   local stdout_file; stdout_file="${tmp_dir}/${key}.stdout"
   local stderr_file; stderr_file="${tmp_dir}/${key}.stderr"
   local exit_file; exit_file="${tmp_dir}/${key}.exit"
 
-  # Mount the script's directory read-only; run from /work inside container
+  # Mount the script's directory read-only; run from /work inside container.
+  # Use || to prevent set -e from triggering on non-zero script exit codes.
+  local exit_code; exit_code=0
   # shellcheck disable=SC2086
   docker run --rm \
     -v "${script_dir}:/work:ro" \
     -w /work \
     "$tag" \
     "$bin" "$script_base" $args \
-    > "$stdout_file" 2> "$stderr_file"
+    > "$stdout_file" 2> "$stderr_file" || exit_code=$?
 
-  local exit_code; exit_code=$?
   printf '%d' "$exit_code" > "$exit_file"
 
-  [ "$verbose" = "1" ] && printf '[shellcast] %s exited with code %d\n' "$shell_ver" "$exit_code"
+  if [ "$verbose" = "1" ]; then
+    printf '[shellcast] %s exited with code %d\n' "$shell_ver" "$exit_code"
+  fi
 }
 
-# List built-in supported shell environments
+# List registered shell environments
 shellcast_executor_list_shells() {
-  printf 'Built-in shell environments:\n'
-  printf '  bash:4    GNU Bash 4.x\n'
-  printf '  bash:5    GNU Bash 5.x\n'
-  printf '  zsh:5     Zsh 5.x (Alpine)\n'
-  printf '  dash:1    Dash 1.x (Debian)\n'
-  printf '  sh:1      POSIX sh / BusyBox (Alpine)\n'
-  printf '  ksh:1     KornShell (Debian)\n'
+  printf 'Registered shell environments:\n'
+  shellcast_registry_list
   printf '\nCustom shells: place a Dockerfile at:\n'
-  printf '  $SHELLCAST_HOME/shell/<type>/<major>/Dockerfile\n'
+  printf '  %s/shell/<type>/<major>/Dockerfile\n' "$PWD"
+  printf '  %s/.shellcast/shell/<type>/<major>/Dockerfile\n' "$HOME"
 }

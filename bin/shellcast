@@ -1,0 +1,689 @@
+#!/usr/bin/env bash
+# @BP010: Release metadata
+# @package: shellcast
+# @build_type: bin
+# @build_with: Mush v0.2.0 (2026-03-20 develop)
+# @build_date: 2026-03-20T21:23:33Z
+set -e
+use() { return 0; }
+extern() { return 0; }
+legacy() { return 0; }
+module() { return 0; }
+public() { return 0; }
+embed() { return 0; }
+inject() { return 0; }
+## BP004: Compile the entrypoint
+
+
+module cli
+module registry
+module executor
+module comparator
+module reporter
+
+SHELLCAST_VERSION="0.1.0"
+
+main() {
+  if [ -z "$SHELLCAST_HOME" ]; then
+    SHELLCAST_HOME="$(cd "$(dirname "$0")" && pwd)"
+    export SHELLCAST_HOME
+  fi
+
+  if [ "$#" -eq 0 ]; then
+    shellcast_cli_usage
+    return 1
+  fi
+
+  local cmd; cmd="$1"
+  shift
+
+  case "$cmd" in
+    run)
+      shellcast_main_cmd_run "$@"
+      ;;
+    shells)
+      shellcast_main_cmd_shells
+      ;;
+    --version|-V)
+      printf 'shellcast %s\n' "$SHELLCAST_VERSION"
+      ;;
+    --help|-h)
+      shellcast_cli_usage
+      ;;
+    *)
+      printf 'shellcast: unknown command: %s\n' "$cmd" >&2
+      shellcast_cli_usage >&2
+      return 1
+      ;;
+  esac
+}
+
+shellcast_main_cmd_run() {
+  shellcast_cli_parse_run "$@" || return 1
+
+  if [ ! -f "$SC_SCRIPT" ]; then
+    printf 'shellcast: script not found: %s\n' "$SC_SCRIPT" >&2
+    return 1
+  fi
+
+  # Build deduplicated list: ref + targets
+  local all_shells; all_shells="$SC_REF"
+  local s; s=""
+  for s in $(printf '%s' "$SC_TARGETS" | tr ',' '\n'); do
+    case ",$all_shells," in
+      *",$s,"*) ;;
+      *) all_shells="${all_shells},${s}" ;;
+    esac
+  done
+
+  # Ensure all Docker images are ready
+  for s in $(printf '%s' "$all_shells" | tr ',' '\n'); do
+    shellcast_executor_ensure_image "$s" || return 1
+  done
+
+  # Create temp directory for per-shell results
+  local tmp_dir; tmp_dir=""
+  tmp_dir=$(mktemp -d)
+  # shellcheck disable=SC2064
+  trap "rm -rf '$tmp_dir'" EXIT INT TERM
+
+  shellcast_reporter_print_header "$SC_SCRIPT" "$SC_REF"
+
+  # Execute script on each shell (sequential or parallel)
+  local pids; pids=""
+  local pid; pid=""
+  for s in $(printf '%s' "$all_shells" | tr ',' '\n'); do
+    if [ "$SC_PARALLEL" = "1" ]; then
+      shellcast_executor_run "$s" "$SC_SCRIPT" "$SC_ARGS" "$tmp_dir" "$SC_VERBOSE" &
+      pid=$!
+      pids="${pids}${pid} "
+    else
+      shellcast_executor_run "$s" "$SC_SCRIPT" "$SC_ARGS" "$tmp_dir" "$SC_VERBOSE"
+    fi
+  done
+
+  # Wait for parallel jobs to finish
+  if [ "$SC_PARALLEL" = "1" ] && [ -n "$pids" ]; then
+    # shellcheck disable=SC2086
+    wait $pids 2>/dev/null || true
+  fi
+
+  # Compare each target against reference.
+  # Use if/else to avoid set -e triggering on non-zero comparator exit (means "diff found").
+  local overall; overall=0
+  local key; key=""
+  local diff_file; diff_file=""
+  local pass; pass=0
+  for s in $(printf '%s' "$SC_TARGETS" | tr ',' '\n'); do
+    key=$(shellcast_executor_key "$s")
+    diff_file="${tmp_dir}/${key}.diff"
+    if shellcast_comparator_compare "$SC_REF" "$s" "$tmp_dir" "$SC_IGNORE" "$diff_file"; then
+      pass=0
+    else
+      pass=1
+      overall=1
+    fi
+    shellcast_reporter_print_result "$s" "$pass" "$diff_file"
+  done
+
+  shellcast_reporter_print_summary "$overall"
+
+  # Write JSON report if requested
+  if [ -n "$SC_REPORT" ]; then
+    shellcast_reporter_write_json \
+      "$SC_SCRIPT" "$SC_REF" "$SC_TARGETS" "$tmp_dir" "$SC_REPORT"
+    printf 'Report saved to: %s\n' "$SC_REPORT"
+  fi
+
+  return "$overall"
+}
+
+shellcast_main_cmd_shells() {
+  shellcast_executor_list_shells
+}
+
+shellcast_cli_usage() {
+  cat <<'EOF'
+Usage: shellcast <command> [options]
+
+Commands:
+  run <script>    Run script across multiple shell environments
+  shells          List available shell environments
+
+Options for 'run':
+  --ref <shell:version>   Reference shell for comparison (default: first in --on list)
+  --on <shells>           Target shells, comma-separated  e.g. bash:5,zsh:5,dash:1
+  --args "<args>"         Arguments to pass to the script
+  --parallel              Run all shells in parallel
+  --report <file>         Save JSON report to file
+  --ignore <pattern>      Ignore output lines matching grep pattern
+  --verbose               Verbose output
+
+Examples:
+  shellcast run script.sh --on bash:5,zsh:5 --ref bash:5
+  shellcast run script.sh --on bash:5,bash:4,dash:1 --parallel --report out.json
+  shellcast run script.sh --on bash:5,zsh:5 --ignore "^#" --verbose
+EOF
+}
+
+shellcast_cli_parse_run() {
+  SC_SCRIPT=""
+  SC_REF=""
+  SC_TARGETS=""
+  SC_ARGS=""
+  SC_PARALLEL=0
+  SC_REPORT=""
+  SC_IGNORE=""
+  SC_VERBOSE=0
+
+  if [ "$#" -eq 0 ]; then
+    printf 'shellcast run: script argument required\n' >&2
+    shellcast_cli_usage >&2
+    return 1
+  fi
+
+  SC_SCRIPT="$1"
+  shift
+
+  while [ "$#" -gt 0 ]; do
+    case "$1" in
+      --ref)
+        shift
+        SC_REF="$1"
+        ;;
+      --ref=*)
+        SC_REF="${1#*=}"
+        ;;
+      --on)
+        shift
+        SC_TARGETS="$1"
+        ;;
+      --on=*)
+        SC_TARGETS="${1#*=}"
+        ;;
+      --args)
+        shift
+        SC_ARGS="$1"
+        ;;
+      --args=*)
+        SC_ARGS="${1#*=}"
+        ;;
+      --parallel)
+        SC_PARALLEL=1
+        ;;
+      --report)
+        shift
+        SC_REPORT="$1"
+        ;;
+      --report=*)
+        SC_REPORT="${1#*=}"
+        ;;
+      --ignore)
+        shift
+        SC_IGNORE="$1"
+        ;;
+      --ignore=*)
+        SC_IGNORE="${1#*=}"
+        ;;
+      --verbose|-v)
+        SC_VERBOSE=1
+        ;;
+      *)
+        printf 'shellcast run: unknown option: %s\n' "$1" >&2
+        return 1
+        ;;
+    esac
+    shift
+  done
+
+  if [ -z "$SC_TARGETS" ]; then
+    printf 'shellcast run: --on <shells> is required\n' >&2
+    return 1
+  fi
+
+  # Default reference to first target shell
+  if [ -z "$SC_REF" ]; then
+    SC_REF="$(printf '%s' "$SC_TARGETS" | cut -d',' -f1)"
+  fi
+
+  export SC_SCRIPT SC_REF SC_TARGETS SC_ARGS SC_PARALLEL SC_REPORT SC_IGNORE SC_VERBOSE
+}
+
+# Hardcoded registry of supported shell environments.
+# Format: "<type>:<major>" one per line.
+# When a new shell image is added, update this list and add its Dockerfile
+# under src/shell/<type>/<major>/Dockerfile.
+SHELLCAST_REGISTRY="
+bash:4
+bash:5
+zsh:5
+dash:1
+sh:1
+ksh:1
+"
+
+# Check if a shell:version is in the registry.
+# Returns 0 if known, 1 if unknown.
+shellcast_registry_is_known() {
+  local shell_ver; shell_ver="$1"
+  local type; type=$(shellcast_executor_type "$shell_ver")
+  local major; major=$(shellcast_executor_major "$shell_ver")
+  local entry; entry="${type}:${major}"
+
+  local line; line=""
+  for line in $SHELLCAST_REGISTRY; do
+    if [ "$line" = "$entry" ]; then
+      return 0
+    fi
+  done
+  return 1
+}
+
+# Print all registered shells
+shellcast_registry_list() {
+  local line; line=""
+  for line in $SHELLCAST_REGISTRY; do
+    printf '  %s\n' "$line"
+  done
+}
+
+
+# Convert shell:version to a safe key for filenames (e.g. bash:5.2 -> bash_5_2)
+shellcast_executor_key() {
+  printf '%s' "$1" | tr ':' '_' | tr '.' '_'
+}
+
+# Extract shell type from shell:version (e.g. bash:5.2 -> bash)
+shellcast_executor_type() {
+  printf '%s' "$1" | cut -d':' -f1
+}
+
+# Extract major version from shell:version (e.g. bash:5.2 -> 5, zsh:5 -> 5)
+shellcast_executor_major() {
+  local ver; ver=""
+  ver=$(printf '%s' "$1" | cut -d':' -f2)
+  printf '%s' "$ver" | cut -d'.' -f1
+}
+
+# Get local Docker image tag for a shell:version
+shellcast_executor_image_tag() {
+  local type; type=$(shellcast_executor_type "$1")
+  local major; major=$(shellcast_executor_major "$1")
+  printf 'shellcast-%s-%s' "$type" "$major"
+}
+
+# Get shell binary name for use inside the container.
+# Uses unqualified names so the container's PATH resolves them correctly
+# (e.g. official bash:5 image has bash at /usr/local/bin/bash, not /bin/bash).
+shellcast_executor_bin() {
+  case "$1" in
+    bash) printf 'bash' ;;
+    zsh)  printf 'zsh'  ;;
+    dash) printf 'dash' ;;
+    sh)   printf 'sh'   ;;
+    ksh)  printf 'ksh'  ;;
+    *)    printf '%s' "$1" ;;
+  esac
+}
+
+# Resolve Dockerfile path for a shell type and major version.
+# Lookup order:
+#   1. $PWD/shell/<type>/<major>/Dockerfile             — project-local override
+#   2. $HOME/.shellcast/shell/<type>/<major>/Dockerfile — user cache
+#   3. Download from GitHub into user cache (only for shells in the registry)
+# Prints the resolved file path on stdout; returns 1 on failure.
+shellcast_executor_resolve_dockerfile() {
+  local type; type="$1"
+  local major; major="$2"
+
+  # 1. Project-local override
+  local local_df; local_df="${PWD}/shell/${type}/${major}/Dockerfile"
+  if [ -f "$local_df" ]; then
+    printf '%s' "$local_df"
+    return 0
+  fi
+
+  # 2. User cache
+  local cache_df; cache_df="${HOME}/.shellcast/shell/${type}/${major}/Dockerfile"
+  if [ -f "$cache_df" ]; then
+    printf '%s' "$cache_df"
+    return 0
+  fi
+
+  # 3. Download from GitHub — only if the shell is in the registry
+  if ! shellcast_registry_is_known "${type}:${major}"; then
+    printf 'shellcast: unknown shell %s:%s (not in registry)\n' "$type" "$major" >&2
+    return 1
+  fi
+
+  local raw_url; raw_url="https://raw.githubusercontent.com/francescobianco/shellcast/main/shell/${type}/${major}/Dockerfile"
+  local cache_dir; cache_dir="${HOME}/.shellcast/shell/${type}/${major}"
+
+  printf '[shellcast] fetching Dockerfile for %s:%s from GitHub...\n' "$type" "$major" >&2
+
+  mkdir -p "$cache_dir" || return 1
+
+  if command -v curl >/dev/null 2>&1; then
+    curl -fsSL "$raw_url" -o "$cache_df" 2>/dev/null || {
+      rm -f "$cache_df"
+      printf 'shellcast: could not fetch Dockerfile for %s:%s from GitHub\n' "$type" "$major" >&2
+      return 1
+    }
+  elif command -v wget >/dev/null 2>&1; then
+    wget -qO "$cache_df" "$raw_url" 2>/dev/null || {
+      rm -f "$cache_df"
+      printf 'shellcast: could not fetch Dockerfile for %s:%s from GitHub\n' "$type" "$major" >&2
+      return 1
+    }
+  else
+    printf 'shellcast: curl or wget required to fetch shell Dockerfiles\n' >&2
+    return 1
+  fi
+
+  printf '%s' "$cache_df"
+}
+
+# Get Dockerfile content for a shell type and major version.
+# Tries to resolve from disk/GitHub first, then falls back to built-in templates.
+shellcast_executor_dockerfile() {
+  local type; type="$1"
+  local major; major="$2"
+
+  local df_path; df_path=""
+  if df_path=$(shellcast_executor_resolve_dockerfile "$type" "$major" 2>/dev/null); then
+    cat "$df_path"
+    return 0
+  fi
+
+  # Built-in fallback templates
+  if [ "${SC_VERBOSE:-0}" = "1" ]; then
+    printf '[shellcast] using built-in Dockerfile template for %s:%s\n' "$type" "$major" >&2
+  fi
+  case "$type" in
+    bash)
+      printf 'FROM bash:%s\n' "$major"
+      printf 'LABEL shellcast.shell="bash" shellcast.version="%s"\n' "$major"
+      ;;
+    zsh)
+      printf 'FROM alpine:3.19\n'
+      printf 'RUN apk add --no-cache zsh\n'
+      printf 'LABEL shellcast.shell="zsh" shellcast.version="%s"\n' "$major"
+      ;;
+    dash)
+      printf 'FROM debian:bookworm-slim\n'
+      printf 'RUN apt-get update && apt-get install -y --no-install-recommends dash \\\n'
+      printf '    && rm -rf /var/lib/apt/lists/*\n'
+      printf 'LABEL shellcast.shell="dash" shellcast.version="%s"\n' "$major"
+      ;;
+    sh)
+      printf 'FROM alpine:3.19\n'
+      printf 'LABEL shellcast.shell="sh" shellcast.version="%s"\n' "$major"
+      ;;
+    ksh)
+      printf 'FROM debian:bookworm-slim\n'
+      printf 'RUN apt-get update && apt-get install -y --no-install-recommends ksh \\\n'
+      printf '    && rm -rf /var/lib/apt/lists/*\n'
+      printf 'LABEL shellcast.shell="ksh" shellcast.version="%s"\n' "$major"
+      ;;
+    *)
+      printf 'shellcast: unsupported shell type: %s\n' "$type" >&2
+      return 1
+      ;;
+  esac
+}
+
+# Build Docker image for shell:version if not already present
+shellcast_executor_ensure_image() {
+  local shell_ver; shell_ver="$1"
+  local type; type=$(shellcast_executor_type "$shell_ver")
+  local major; major=$(shellcast_executor_major "$shell_ver")
+  local tag; tag=$(shellcast_executor_image_tag "$shell_ver")
+
+  if docker image inspect "$tag" >/dev/null 2>&1; then
+    if [ "${SC_VERBOSE:-0}" = "1" ]; then
+      printf '[shellcast] image %s already exists\n' "$tag"
+    fi
+    return 0
+  fi
+
+  printf '[shellcast] building image %s...\n' "$tag"
+
+  local dockerfile_content; dockerfile_content=""
+  dockerfile_content=$(shellcast_executor_dockerfile "$type" "$major") || return 1
+
+  printf '%s\n' "$dockerfile_content" | docker build -t "$tag" - || {
+    printf 'shellcast: failed to build image for %s\n' "$shell_ver" >&2
+    return 1
+  }
+
+  printf '[shellcast] image %s ready\n' "$tag"
+}
+
+# Run script inside a container for the given shell:version.
+# Outputs are saved to $tmp_dir/<key>.stdout, .stderr, .exit
+shellcast_executor_run() {
+  local shell_ver; shell_ver="$1"
+  local script; script="$2"
+  local args; args="$3"
+  local tmp_dir; tmp_dir="$4"
+  local verbose; verbose="${5:-0}"
+
+  local key; key=$(shellcast_executor_key "$shell_ver")
+  local type; type=$(shellcast_executor_type "$shell_ver")
+  local tag; tag=$(shellcast_executor_image_tag "$shell_ver")
+  local bin; bin=$(shellcast_executor_bin "$type")
+
+  local script_abs; script_abs=""
+  script_abs=$(realpath "$script")
+  local script_dir; script_dir=""
+  script_dir=$(dirname "$script_abs")
+  local script_base; script_base=""
+  script_base=$(basename "$script_abs")
+
+  if [ "$verbose" = "1" ]; then
+    printf '[shellcast] running %s on %s\n' "$script_base" "$shell_ver"
+  fi
+
+  local stdout_file; stdout_file="${tmp_dir}/${key}.stdout"
+  local stderr_file; stderr_file="${tmp_dir}/${key}.stderr"
+  local exit_file; exit_file="${tmp_dir}/${key}.exit"
+
+  # Mount the script's directory read-only; run from /work inside container.
+  # Use || to prevent set -e from triggering on non-zero script exit codes.
+  local exit_code; exit_code=0
+  # shellcheck disable=SC2086
+  docker run --rm \
+    -v "${script_dir}:/work:ro" \
+    -w /work \
+    "$tag" \
+    "$bin" "$script_base" $args \
+    > "$stdout_file" 2> "$stderr_file" || exit_code=$?
+
+  printf '%d' "$exit_code" > "$exit_file"
+
+  if [ "$verbose" = "1" ]; then
+    printf '[shellcast] %s exited with code %d\n' "$shell_ver" "$exit_code"
+  fi
+}
+
+# List registered shell environments
+shellcast_executor_list_shells() {
+  printf 'Registered shell environments:\n'
+  shellcast_registry_list
+  printf '\nCustom shells: place a Dockerfile at:\n'
+  printf '  %s/shell/<type>/<major>/Dockerfile\n' "$PWD"
+  printf '  %s/.shellcast/shell/<type>/<major>/Dockerfile\n' "$HOME"
+}
+
+# Compare reference and target shell outputs.
+# Writes diff content to diff_file.
+# Returns 0 if identical, 1 if different.
+shellcast_comparator_compare() {
+  local ref; ref="$1"
+  local target; target="$2"
+  local tmp_dir; tmp_dir="$3"
+  local ignore; ignore="$4"
+  local diff_file; diff_file="$5"
+
+  local ref_key; ref_key=$(shellcast_executor_key "$ref")
+  local tgt_key; tgt_key=$(shellcast_executor_key "$target")
+
+  local ref_stdout; ref_stdout="${tmp_dir}/${ref_key}.stdout"
+  local ref_stderr; ref_stderr="${tmp_dir}/${ref_key}.stderr"
+  local ref_exit; ref_exit="${tmp_dir}/${ref_key}.exit"
+
+  local tgt_stdout; tgt_stdout="${tmp_dir}/${tgt_key}.stdout"
+  local tgt_stderr; tgt_stderr="${tmp_dir}/${tgt_key}.stderr"
+  local tgt_exit; tgt_exit="${tmp_dir}/${tgt_key}.exit"
+
+  local ref_ec; ref_ec=0
+  local tgt_ec; tgt_ec=0
+  [ -f "$ref_exit" ] && ref_ec=$(cat "$ref_exit")
+  [ -f "$tgt_exit" ] && tgt_ec=$(cat "$tgt_exit")
+
+  local any_diff; any_diff=0
+
+  {
+    # Exit code mismatch
+    if [ "$ref_ec" != "$tgt_ec" ]; then
+      printf '[exit_code] expected %s, got %s\n' "$ref_ec" "$tgt_ec"
+      any_diff=1
+    fi
+
+    # Stdout comparison — optionally filter lines matching ignore pattern
+    local ref_out; ref_out="$ref_stdout"
+    local tgt_out; tgt_out="$tgt_stdout"
+
+    if [ -n "$ignore" ]; then
+      local ref_filtered; ref_filtered="${tmp_dir}/${ref_key}.stdout.filtered"
+      local tgt_filtered; tgt_filtered="${tmp_dir}/${tgt_key}.stdout.filtered"
+      grep -Ev "$ignore" "$ref_out" > "$ref_filtered" 2>/dev/null || true
+      grep -Ev "$ignore" "$tgt_out" > "$tgt_filtered" 2>/dev/null || true
+      ref_out="$ref_filtered"
+      tgt_out="$tgt_filtered"
+    fi
+
+    local stdout_diff; stdout_diff=""
+    stdout_diff=$(diff -u "$ref_out" "$tgt_out" 2>/dev/null || true)
+    if [ -n "$stdout_diff" ]; then
+      printf '[stdout]\n%s\n' "$stdout_diff"
+      any_diff=1
+    fi
+
+    # Stderr comparison
+    local stderr_diff; stderr_diff=""
+    stderr_diff=$(diff -u "$ref_stderr" "$tgt_stderr" 2>/dev/null || true)
+    if [ -n "$stderr_diff" ]; then
+      printf '[stderr]\n%s\n' "$stderr_diff"
+      any_diff=1
+    fi
+  } > "$diff_file"
+
+  return "$any_diff"
+}
+
+SHELLCAST_COLOR_GREEN='\033[0;32m'
+SHELLCAST_COLOR_RED='\033[0;31m'
+SHELLCAST_COLOR_CYAN='\033[0;36m'
+SHELLCAST_COLOR_BOLD='\033[1m'
+SHELLCAST_COLOR_RESET='\033[0m'
+
+shellcast_reporter_print_header() {
+  local script; script="$1"
+  local ref; ref="$2"
+  printf "${SHELLCAST_COLOR_BOLD}shellcast${SHELLCAST_COLOR_RESET}  script: %s  ref: %s\n\n" \
+    "$script" "$ref"
+}
+
+shellcast_reporter_print_result() {
+  local shell_ver; shell_ver="$1"
+  local pass; pass="$2"
+  local diff_file; diff_file="$3"
+
+  if [ "$pass" = "0" ]; then
+    printf "  ${SHELLCAST_COLOR_GREEN}PASS${SHELLCAST_COLOR_RESET}  %s\n" "$shell_ver"
+  else
+    printf "  ${SHELLCAST_COLOR_RED}FAIL${SHELLCAST_COLOR_RESET}  %s\n" "$shell_ver"
+    if [ -f "$diff_file" ] && [ -s "$diff_file" ]; then
+      printf "${SHELLCAST_COLOR_CYAN}"
+      sed 's/^/        /' "$diff_file"
+      printf "${SHELLCAST_COLOR_RESET}"
+    fi
+  fi
+}
+
+shellcast_reporter_print_summary() {
+  local overall; overall="$1"
+  printf '\n'
+  if [ "$overall" = "0" ]; then
+    printf "${SHELLCAST_COLOR_GREEN}${SHELLCAST_COLOR_BOLD}All shells match reference.${SHELLCAST_COLOR_RESET}\n"
+  else
+    printf "${SHELLCAST_COLOR_RED}${SHELLCAST_COLOR_BOLD}Some shells differ from reference.${SHELLCAST_COLOR_RESET}\n"
+  fi
+}
+
+# Minimal JSON string escaping
+shellcast_reporter_json_escape() {
+  printf '%s' "$1" \
+    | sed 's/\\/\\\\/g; s/"/\\"/g' \
+    | awk '{ printf "%s\\n", $0 }' \
+    | sed 's/\\n$//'
+}
+
+# Write full JSON report to output file
+shellcast_reporter_write_json() {
+  local script; script="$1"
+  local ref; ref="$2"
+  local targets; targets="$3"
+  local tmp_dir; tmp_dir="$4"
+  local out_file; out_file="$5"
+
+  local script_esc; script_esc=$(shellcast_reporter_json_escape "$script")
+  local ref_esc; ref_esc=$(shellcast_reporter_json_escape "$ref")
+
+  {
+    printf '{\n'
+    printf '  "script": "%s",\n' "$script_esc"
+    printf '  "reference": "%s",\n' "$ref_esc"
+    printf '  "results": [\n'
+
+    local first; first=1
+    local s; s=""
+    for s in $(printf '%s' "$targets" | tr ',' '\n'); do
+      local key; key=$(shellcast_executor_key "$s")
+      local exit_file; exit_file="${tmp_dir}/${key}.exit"
+      local diff_file; diff_file="${tmp_dir}/${key}.diff"
+
+      local exit_code; exit_code=0
+      [ -f "$exit_file" ] && exit_code=$(cat "$exit_file")
+
+      local has_diff; has_diff=0
+      local diff_esc; diff_esc=""
+      if [ -f "$diff_file" ] && [ -s "$diff_file" ]; then
+        has_diff=1
+        diff_esc=$(shellcast_reporter_json_escape "$(cat "$diff_file")")
+      fi
+
+      local s_esc; s_esc=$(shellcast_reporter_json_escape "$s")
+
+      [ "$first" = "0" ] && printf ',\n'
+      printf '    {\n'
+      printf '      "shell": "%s",\n' "$s_esc"
+      printf '      "exit_code": %d,\n' "$exit_code"
+      if [ "$has_diff" = "0" ]; then
+        printf '      "pass": true,\n'
+        printf '      "diff": null\n'
+      else
+        printf '      "pass": false,\n'
+        printf '      "diff": "%s"\n' "$diff_esc"
+      fi
+      printf '    }'
+      first=0
+    done
+
+    printf '\n  ]\n'
+    printf '}\n'
+  } > "$out_file"
+}
+## BP005: Execute the entrypoint
+main "$@"
